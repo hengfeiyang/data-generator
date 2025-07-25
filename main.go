@@ -254,7 +254,7 @@ func (c *HTTPClient) PostJSON() Response {
 }
 
 // RunMultiple executes the POST request multiple times
-func (c *HTTPClient) RunMultiple(times int) {
+func (c *HTTPClient) RunMultiple(times int, generator *DataGenerator) {
 	fmt.Printf("Running HTTP POST request %d times to: %s\n", times, c.URL)
 	fmt.Println("=" + strings.Repeat("=", 50))
 
@@ -263,6 +263,11 @@ func (c *HTTPClient) RunMultiple(times int) {
 
 	for i := 1; i <= times; i++ {
 		fmt.Printf("\n[Request %d/%d]\n", i, times)
+
+		// Generate new data for each request
+		if generator != nil {
+			c.Data = generator.GenerateData()
+		}
 
 		resp := c.PostJSON()
 
@@ -323,16 +328,9 @@ func main() {
 
 	// Check if we should auto-generate data or use provided data
 	if *data == "" {
-		// Auto-generate data
-		generator := &DataGenerator{
-			FieldCount:    *fieldCount,
-			RecordsPerReq: *recordsPerReq,
-		}
-		jsonData = generator.GenerateData()
-
-		// Print generated data preview
-		preview, _ := json.MarshalIndent(jsonData, "", "  ")
-		fmt.Printf("🔄 Auto-generated data preview:\n%s\n\n", string(preview))
+		// For auto-generated data, we'll generate it in RunMultiple
+		jsonData = nil
+		fmt.Printf("🔄 Will auto-generate new data for each request\n\n")
 	} else {
 		// Parse provided JSON data
 		if err := json.Unmarshal([]byte(*data), &jsonData); err != nil {
@@ -355,5 +353,15 @@ func main() {
 	}
 
 	// Run the requests
-	client.RunMultiple(*times)
+	if *data == "" {
+		// Auto-generate data for each request
+		generator := &DataGenerator{
+			FieldCount:    *fieldCount,
+			RecordsPerReq: *recordsPerReq,
+		}
+		client.RunMultiple(*times, generator)
+	} else {
+		// Use provided data (same data for all requests)
+		client.RunMultiple(*times, nil)
+	}
 }
