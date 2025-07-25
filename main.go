@@ -135,29 +135,15 @@ func generateLogRecord() LogRecord {
 	}
 }
 
-func convertLogToData(log LogRecord) map[string]interface{} {
-	data := make(map[string]interface{})
-	data["timestamp"] = log.Timestamp
-	data["ip"] = log.IP
-	data["method"] = log.Method
-	data["path"] = log.Path
-	data["status"] = log.Status
-	data["bytes"] = log.Bytes
-	data["user_agent"] = log.UserAgent
-	data["referer"] = log.Referer
-	data["request_time"] = log.RequestTime
-	data["remote_addr"] = log.RemoteAddr
-	data["server_name"] = log.ServerName
-
-	return data
-}
-
 // generateRandomData generates random JSON data with specified number of fields
 func generateRandomData(fieldCount int) map[string]interface{} {
+	data := make(map[string]interface{})
 	// Generate log record as the base data
 	log := generateLogRecord()
-	// Add log record to data, as root fields
-	data := convertLogToData(log)
+	// Add log record to data as a string
+	if logBytes, err := json.Marshal(log); err == nil {
+		data["message"] = string(logBytes)
+	}
 
 	// Always include timestamp
 	data["timestamp"] = time.Now().Format(time.RFC3339)
@@ -166,7 +152,7 @@ func generateRandomData(fieldCount int) map[string]interface{} {
 	// Generate additional random fields (all single values, no arrays)
 	fieldNames := []string{"user_id", "session_id", "action", "resource", "category", "priority", "level", "source", "target", "metadata"}
 
-	for i := 0; i < fieldCount-2; i++ { // -2 because we already added timestamp and request_id
+	for i := 0; i < fieldCount-3; i++ { // -3 because we already added timestamp, request_id, and message
 		fieldName := fieldNames[i%len(fieldNames)] + strconv.Itoa(i)
 
 		// Randomly choose between string, number, and boolean (no arrays)
