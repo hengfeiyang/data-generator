@@ -1,7 +1,7 @@
 #!/bin/bash
 
-echo "🚀 HTTP Client Examples"
-echo "======================="
+echo "🚀 HTTP Data Generator Examples"
+echo "==============================="
 
 echo ""
 echo "1. Simple POST request (with defaults):"

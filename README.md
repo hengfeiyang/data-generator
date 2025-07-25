@@ -1,4 +1,6 @@
-# HTTP Client with JSON POST and Basic Auth
+# Data generator
+
+HTTP Client with JSON POST and Basic Auth
 
 A Go HTTP client that can post JSON data with HTTP basic authentication, print execution time, support running multiple times, and **auto-generate JSON data** with configurable fields and records.
 
@@ -28,12 +30,6 @@ go run main.go
 
 # POST with custom auto-generated data (10 fields, 3 records per request)
 go run main.go -fields 10 -records 3
-
-# POST with nginx-like log data
-go run main.go -logs
-
-# POST with multiple log records
-go run main.go -logs -records 5
 
 # POST with custom URL but default auth
 go run main.go -url "https://httpbin.org/post"
@@ -66,7 +62,6 @@ go run main.go -url "https://httpbin.org/post" \
 | `-header` | Additional header in format 'key:value' | `""` | No |
 | `-fields` | Number of fields to generate in auto-generated data | `5` | No |
 | `-records` | Number of records per request | `1` | No |
-| `-logs` | Generate log-style data (nginx-like logs) | `false` | No |
 
 ### Examples
 
@@ -87,36 +82,24 @@ go run main.go -records 3
 go run main.go -fields 10 -records 2
 ```
 
-#### 3. Nginx-like Log Data
-```bash
-# Generate single log record
-go run main.go -logs
-
-# Generate multiple log records
-go run main.go -logs -records 5
-
-# Generate logs with multiple requests
-go run main.go -logs -records 3 -times 10
-```
-
-#### 4. POST with Basic Authentication (custom credentials)
+#### 3. POST with Basic Authentication (custom credentials)
 ```bash
 go run main.go -user "customuser" -pass "custompass"
 ```
 
-#### 5. Load Testing (Multiple Requests)
+#### 4. Load Testing (Multiple Requests)
 ```bash
 go run main.go -data '{"test": "data"}' -times 10
 ```
 
-#### 6. Custom Headers
+#### 5. Custom Headers
 ```bash
 go run main.go -data '{"api_version": "v2"}' \
   -header "X-API-Version: 2.0" \
   -header "X-Request-ID: 12345"
 ```
 
-#### 7. Override Default URL
+#### 6. Override Default URL
 ```bash
 go run main.go -url "https://httpbin.org/post" -data '{"message": "Hello"}'
 ```
@@ -124,7 +107,7 @@ go run main.go -url "https://httpbin.org/post" -data '{"message": "Hello"}'
 ## Auto-Generated Data Types
 
 ### Standard JSON Data
-When not using `-logs`, the client generates random JSON data with these field types:
+The data generates random JSON data with these field types:
 - **timestamp**: Current timestamp in RFC3339 format
 - **request_id**: Random 16-character string
 - **user_id**: Random string
@@ -138,8 +121,7 @@ When not using `-logs`, the client generates random JSON data with these field t
 - **target**: Random string
 - **metadata**: Random array of strings
 
-### Nginx-like Log Data
-When using `-logs`, the client generates realistic log entries with:
+Also include a `message` field that is a json struct include these fields:
 - **timestamp**: Current timestamp
 - **ip**: Random IP address
 - **method**: HTTP method (GET, POST, PUT, DELETE, PATCH)
@@ -212,7 +194,7 @@ The client automatically adds the `Authorization: Basic <base64-encoded-credenti
 ### Auto-Generated Data
 - **No data provided**: Automatically generates JSON data based on `-fields` and `-records` parameters
 - **Custom data provided**: Uses the provided JSON data instead of auto-generating
-- **Log data**: Generates realistic nginx-like log entries when `-logs` flag is used
+- **Log data**: Generates realistic nginx-like log entries for each record
 
 ### Timing Measurement
 Each request is timed from start to finish, including:
@@ -232,20 +214,19 @@ You can add custom headers using the `-header` flag. The format is `key:value`.
 ### Multiple Records
 - **Single record**: Sends one JSON object per request
 - **Multiple records**: Sends an array of JSON objects per request
-- **Log records**: Sends one or multiple log entries per request
 
 ## Building
 
 To build the executable:
 
 ```bash
-go build -o httpclient main.go
+go build -o data_generator main.go
 ```
 
 Then run it:
 
 ```bash
-./httpclient -fields 8 -records 3
+./data_generator -fields 8 -records 3
 ```
 
 ## Testing
