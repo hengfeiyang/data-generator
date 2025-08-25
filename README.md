@@ -220,13 +220,13 @@ You can add custom headers using the `-header` flag. The format is `key:value`.
 To build the executable:
 
 ```bash
-go build -o data_generator main.go
+go build -o data-generator main.go
 ```
 
 Then run it:
 
 ```bash
-./data_generator -fields 8 -records 3
+./data-generator -fields 8 -records 3
 ```
 
 ## Testing

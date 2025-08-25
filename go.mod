@@ -1,3 +1,3 @@
-module data_generator
+module data-generator
 
 go 1.24.4
