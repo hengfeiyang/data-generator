@@ -14,6 +14,7 @@ A Go HTTP client that can post JSON data with HTTP basic authentication, print e
 - ✅ **Auto-generate JSON data** with configurable fields
 - ✅ **Generate multiple records per request**
 - ✅ **Generate nginx-like log data**
+- ✅ **Generate random body field with configurable size (1KB-500KB)**
 - ✅ Detailed response logging
 - ✅ Error handling and summary statistics
 
@@ -48,6 +49,16 @@ go run main.go -url "https://httpbin.org/post" \
   -records 2 \
   -times 3 \
   -header "X-Custom-Header: myvalue"
+
+# Enable body field with random size (1KB-500KB)
+go run main.go -body
+
+# Complete example with body field enabled
+go run main.go -url "https://httpbin.org/post" \
+  -fields 10 \
+  -records 3 \
+  -body \
+  -times 5
 ```
 
 ### Command Line Options
@@ -62,6 +73,7 @@ go run main.go -url "https://httpbin.org/post" \
 | `-header` | Additional header in format 'key:value' | `""` | No |
 | `-fields` | Number of fields to generate in auto-generated data | `5` | No |
 | `-records` | Number of records per request | `1` | No |
+| `-body` | Enable body field with random size (1KB-500KB) | `false` | No |
 
 ### Examples
 
@@ -104,6 +116,24 @@ go run main.go -data '{"api_version": "v2"}' \
 go run main.go -url "https://httpbin.org/post" -data '{"message": "Hello"}'
 ```
 
+#### 7. Enable Body Field with Random Size
+```bash
+# Enable body field with random size (1KB-500KB)
+go run main.go -body
+
+# Generate data with body field and multiple records
+go run main.go -fields 8 -records 2 -body
+
+# Complete example with body field
+go run main.go -url "https://httpbin.org/post" \
+  -user "testuser" \
+  -pass "testpass" \
+  -fields 10 \
+  -records 3 \
+  -body \
+  -times 5
+```
+
 ## Auto-Generated Data Types
 
 ### Standard JSON Data
@@ -133,6 +163,7 @@ Also include a `message` field that is a json struct include these fields:
 - **request_time**: Random request time (0.1-2.1 seconds)
 - **remote_addr**: Random client IP
 - **server_name**: Random nginx server name
+- **body**: Random base64-encoded binary data (1KB-500KB) - only included when `-body` flag is enabled
 
 ## Output Format
 
@@ -195,6 +226,7 @@ The client automatically adds the `Authorization: Basic <base64-encoded-credenti
 - **No data provided**: Automatically generates JSON data based on `-fields` and `-records` parameters
 - **Custom data provided**: Uses the provided JSON data instead of auto-generating
 - **Log data**: Generates realistic nginx-like log entries for each record
+- **Body field**: When `-body` flag is enabled, includes random base64-encoded binary data (1KB-500KB) in the log record
 
 ### Timing Measurement
 Each request is timed from start to finish, including:
