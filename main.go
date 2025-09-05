@@ -45,12 +45,14 @@ type LogRecord struct {
 	RequestTime float64 `json:"request_time"`
 	RemoteAddr  string  `json:"remote_addr"`
 	ServerName  string  `json:"server_name"`
+	Body        *string `json:"body,omitempty"`
 }
 
 // DataGenerator handles auto-generation of JSON data
 type DataGenerator struct {
 	FieldCount    int
 	RecordsPerReq int
+	EnableBody    bool
 }
 
 // NewHTTPClient creates a new HTTP client instance
@@ -117,10 +119,29 @@ func generateRandomReferer() string {
 	return domains[rand.Intn(len(domains))]
 }
 
+// generateRandomBody generates random binary data and returns it as base64 encoded string
+func generateRandomBody(sizeKB int) string {
+	if sizeKB == 0 {
+		return ""
+	}
+
+	// Convert KB to bytes
+	sizeBytes := sizeKB * 1024
+
+	// Generate random binary data
+	randomData := make([]byte, sizeBytes)
+	for i := range randomData {
+		randomData[i] = byte(rand.Intn(256))
+	}
+
+	// Encode to base64
+	return base64.StdEncoding.EncodeToString(randomData)
+}
+
 // generateLogRecord generates a single log record
-func generateLogRecord() LogRecord {
+func generateLogRecord(enableBody bool) LogRecord {
 	now := time.Now()
-	return LogRecord{
+	log := LogRecord{
 		Timestamp:   now.Format(time.RFC3339),
 		IP:          generateRandomIP(),
 		Method:      []string{"GET", "POST", "PUT", "DELETE", "PATCH"}[rand.Intn(5)],
@@ -133,13 +154,23 @@ func generateLogRecord() LogRecord {
 		RemoteAddr:  generateRandomIP(),
 		ServerName:  "nginx-server-" + generateRandomString(4),
 	}
+
+	// Only add body field if enabled, with random size between 1KB-500KB
+	if enableBody {
+		// Generate random size between 1KB and 500KB
+		bodySizeKB := rand.Intn(500)
+		body := generateRandomBody(bodySizeKB)
+		log.Body = &body
+	}
+
+	return log
 }
 
 // generateRandomData generates random JSON data with specified number of fields
-func generateRandomData(fieldCount int) map[string]interface{} {
+func generateRandomData(fieldCount int, enableBody bool) map[string]interface{} {
 	data := make(map[string]interface{})
 	// Generate log record as the base data
-	log := generateLogRecord()
+	log := generateLogRecord(enableBody)
 	// Add log record to data as a string
 	if logBytes, err := json.Marshal(log); err == nil {
 		data["message"] = string(logBytes)
@@ -174,12 +205,12 @@ func generateRandomData(fieldCount int) map[string]interface{} {
 // GenerateData generates JSON data based on the generator configuration
 func (dg *DataGenerator) GenerateData() interface{} {
 	if dg.RecordsPerReq == 1 {
-		return generateRandomData(dg.FieldCount)
+		return generateRandomData(dg.FieldCount, dg.EnableBody)
 	} else {
 		// Generate multiple records
 		records := make([]map[string]interface{}, dg.RecordsPerReq)
 		for i := 0; i < dg.RecordsPerReq; i++ {
-			records[i] = generateRandomData(dg.FieldCount)
+			records[i] = generateRandomData(dg.FieldCount, dg.EnableBody)
 		}
 		return records
 	}
@@ -313,6 +344,7 @@ func main() {
 		header        = flag.String("header", "", "Additional header in format 'key:value' (can be used multiple times)")
 		fieldCount    = flag.Int("fields", 5, "Number of fields to generate in auto-generated data")
 		recordsPerReq = flag.Int("records", 1, "Number of records per request")
+		enableBody    = flag.Bool("body", false, "Enable body field with random size (1KB-500KB)")
 	)
 	flag.Parse()
 
@@ -358,6 +390,7 @@ func main() {
 		generator := &DataGenerator{
 			FieldCount:    *fieldCount,
 			RecordsPerReq: *recordsPerReq,
+			EnableBody:    *enableBody,
 		}
 		client.RunMultiple(*times, generator)
 	} else {
