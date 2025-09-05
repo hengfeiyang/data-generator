@@ -155,10 +155,10 @@ func generateLogRecord(enableBody bool) LogRecord {
 		ServerName:  "nginx-server-" + generateRandomString(4),
 	}
 
-	// Only add body field if enabled, with random size between 1KB-500KB
+	// Only add body field if enabled, with random size between 1KB-200KB
 	if enableBody {
-		// Generate random size between 1KB and 500KB
-		bodySizeKB := rand.Intn(500)
+		// Generate random size between 1KB and 200KB
+		bodySizeKB := rand.Intn(200)
 		body := generateRandomBody(bodySizeKB)
 		log.Body = &body
 	}
@@ -344,7 +344,7 @@ func main() {
 		header        = flag.String("header", "", "Additional header in format 'key:value' (can be used multiple times)")
 		fieldCount    = flag.Int("fields", 5, "Number of fields to generate in auto-generated data")
 		recordsPerReq = flag.Int("records", 1, "Number of records per request")
-		enableBody    = flag.Bool("body", false, "Enable body field with random size (1KB-500KB)")
+		enableBody    = flag.Bool("body", false, "Enable body field with random size (1KB-200KB)")
 	)
 	flag.Parse()
 
