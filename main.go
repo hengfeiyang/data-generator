@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -284,50 +285,92 @@ func (c *HTTPClient) PostJSON() Response {
 	}
 }
 
-// RunMultiple executes the POST request multiple times
-func (c *HTTPClient) RunMultiple(times int, generator *DataGenerator) {
+// RunMultiple executes the POST request multiple times with optional concurrent execution
+func (c *HTTPClient) RunMultiple(times int, threads int, generator *DataGenerator) {
 	fmt.Printf("Running HTTP POST request %d times to: %s\n", times, c.URL)
+	if threads > 1 {
+		fmt.Printf("Using %d concurrent threads\n", threads)
+	}
 	fmt.Println("=" + strings.Repeat("=", 50))
 
-	var totalDuration time.Duration
-	var successCount, errorCount int
+	// Shared variables for thread-safe operations
+	var (
+		totalDuration time.Duration
+		successCount  int
+		errorCount    int
+		mu            sync.Mutex
+		wg            sync.WaitGroup
+	)
 
-	for i := 1; i <= times; i++ {
-		fmt.Printf("\n[Request %d/%d]\n", i, times)
+	// Channel to distribute work among goroutines
+	workChan := make(chan int, times)
 
-		// Generate new data for each request
-		if generator != nil {
-			c.Data = generator.GenerateData()
-		}
+	// Start worker goroutines
+	for i := 0; i < threads; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
 
-		resp := c.PostJSON()
+			for requestNum := range workChan {
+				// Create a copy of the client for this goroutine to avoid race conditions
+				clientCopy := &HTTPClient{
+					URL:      c.URL,
+					Username: c.Username,
+					Password: c.Password,
+					Headers:  make(map[string]string),
+				}
 
-		if resp.Error != nil {
-			errorCount++
-			fmt.Printf("❌ Error: %v\n", resp.Error)
-		} else {
-			successCount++
-			fmt.Printf("✅ Status: %d\n", resp.StatusCode)
-			fmt.Printf("📄 Response Body: %s\n", resp.Body)
-		}
+				// Copy headers
+				for k, v := range c.Headers {
+					clientCopy.Headers[k] = v
+				}
 
-		fmt.Printf("⏱️  Duration: %v\n", resp.Duration)
-		totalDuration += resp.Duration
+				// Generate new data for each request
+				if generator != nil {
+					clientCopy.Data = generator.GenerateData()
+				} else {
+					clientCopy.Data = c.Data
+				}
 
-		// Add a small delay between requests to be respectful
-		if i < times {
-			time.Sleep(100 * time.Millisecond)
-		}
+				resp := clientCopy.PostJSON()
+
+				// Thread-safe update of counters and duration
+				mu.Lock()
+				if resp.Error != nil {
+					errorCount++
+					fmt.Printf("\n[Request %d/%d] ❌ Error: %v\n", requestNum, times, resp.Error)
+				} else {
+					successCount++
+					fmt.Printf("\n[Request %d/%d] ✅ Status: %d\n", requestNum, times, resp.StatusCode)
+					fmt.Printf("📄 Response Body: %s\n", resp.Body)
+				}
+				fmt.Printf("⏱️  Duration: %v\n", resp.Duration)
+				totalDuration += resp.Duration
+				mu.Unlock()
+			}
+		}(i)
 	}
+
+	// Send work to the channel
+	for i := 1; i <= times; i++ {
+		workChan <- i
+	}
+	close(workChan)
+
+	// Wait for all goroutines to complete
+	wg.Wait()
 
 	// Print summary
 	fmt.Println("\n" + strings.Repeat("=", 50))
 	fmt.Printf("📊 Summary:\n")
 	fmt.Printf("   Total Requests: %d\n", times)
+	fmt.Printf("   Concurrent Threads: %d\n", threads)
 	fmt.Printf("   Successful: %d\n", successCount)
 	fmt.Printf("   Failed: %d\n", errorCount)
 	fmt.Printf("   Total Duration: %v\n", totalDuration)
-	fmt.Printf("   Average Duration: %v\n", totalDuration/time.Duration(times))
+	if times > 0 {
+		fmt.Printf("   Average Duration: %v\n", totalDuration/time.Duration(times))
+	}
 }
 
 func main() {
@@ -340,6 +383,7 @@ func main() {
 		username      = flag.String("user", "root@example.com", "Username for basic auth")
 		password      = flag.String("pass", "Complexpass#123", "Password for basic auth")
 		times         = flag.Int("times", 1, "Number of times to run the request")
+		threads       = flag.Int("threads", 1, "Number of concurrent threads to use")
 		data          = flag.String("data", "", "JSON data to send (leave empty to auto-generate)")
 		header        = flag.String("header", "", "Additional header in format 'key:value' (can be used multiple times)")
 		fieldCount    = flag.Int("fields", 5, "Number of fields to generate in auto-generated data")
@@ -354,6 +398,15 @@ func main() {
 		fmt.Println("Usage: go run main.go -url <target_url> [options]")
 		flag.PrintDefaults()
 		os.Exit(1)
+	}
+
+	// Validate threads parameter
+	if *threads < 1 {
+		fmt.Println("❌ Error: threads must be at least 1")
+		os.Exit(1)
+	}
+	if *threads > 100 {
+		fmt.Println("⚠️  Warning: Using more than 100 threads may cause performance issues")
 	}
 
 	var jsonData interface{}
@@ -392,9 +445,9 @@ func main() {
 			RecordsPerReq: *recordsPerReq,
 			EnableBody:    *enableBody,
 		}
-		client.RunMultiple(*times, generator)
+		client.RunMultiple(*times, *threads, generator)
 	} else {
 		// Use provided data (same data for all requests)
-		client.RunMultiple(*times, nil)
+		client.RunMultiple(*times, *threads, nil)
 	}
 }

@@ -10,6 +10,7 @@ A Go HTTP client that can post JSON data with HTTP basic authentication, print e
 - ✅ HTTP Basic Authentication support
 - ✅ Execution time measurement
 - ✅ Multiple execution support
+- ✅ **Multi-threading support** for concurrent requests
 - ✅ Custom headers support
 - ✅ **Auto-generate JSON data** with configurable fields
 - ✅ **Generate multiple records per request**
@@ -41,24 +42,29 @@ go run main.go -user "username" -pass "password"
 # Run multiple times
 go run main.go -times 5
 
-# Complete example with auto-generated data
+# Run with multiple threads for faster execution
+go run main.go -times 10 -threads 5
+
+# Complete example with auto-generated data and multi-threading
 go run main.go -url "https://httpbin.org/post" \
   -user "myuser" \
   -pass "mypassword" \
   -fields 8 \
   -records 2 \
-  -times 3 \
+  -times 10 \
+  -threads 3 \
   -header "X-Custom-Header: myvalue"
 
 # Enable body field with random size (1KB-500KB)
 go run main.go -body
 
-# Complete example with body field enabled
+# Complete example with body field enabled and multi-threading
 go run main.go -url "https://httpbin.org/post" \
   -fields 10 \
   -records 3 \
   -body \
-  -times 5
+  -times 10 \
+  -threads 4
 ```
 
 ### Command Line Options
@@ -69,6 +75,7 @@ go run main.go -url "https://httpbin.org/post" \
 | `-user` | Username for basic auth | `root@example.com` | No |
 | `-pass` | Password for basic auth | `Complexpass#123` | No |
 | `-times` | Number of times to run the request | `1` | No |
+| `-threads` | Number of concurrent threads to use | `1` | No |
 | `-data` | JSON data to send (leave empty to auto-generate) | `""` | No |
 | `-header` | Additional header in format 'key:value' | `""` | No |
 | `-fields` | Number of fields to generate in auto-generated data | `5` | No |
@@ -101,7 +108,11 @@ go run main.go -user "customuser" -pass "custompass"
 
 #### 4. Load Testing (Multiple Requests)
 ```bash
+# Sequential execution
 go run main.go -data '{"test": "data"}' -times 10
+
+# Concurrent execution with 5 threads
+go run main.go -data '{"test": "data"}' -times 10 -threads 5
 ```
 
 #### 5. Custom Headers
@@ -124,14 +135,27 @@ go run main.go -body
 # Generate data with body field and multiple records
 go run main.go -fields 8 -records 2 -body
 
-# Complete example with body field
+# Complete example with body field and multi-threading
 go run main.go -url "https://httpbin.org/post" \
   -user "testuser" \
   -pass "testpass" \
   -fields 10 \
   -records 3 \
   -body \
-  -times 5
+  -times 10 \
+  -threads 3
+```
+
+#### 8. Multi-Threading Examples
+```bash
+# High-performance load testing with 20 concurrent threads
+go run main.go -url "https://httpbin.org/post" -times 100 -threads 20
+
+# Auto-generated data with concurrent execution
+go run main.go -fields 15 -records 2 -times 50 -threads 10
+
+# Stress testing with maximum concurrency
+go run main.go -url "https://httpbin.org/post" -times 1000 -threads 50
 ```
 
 ## Auto-Generated Data Types
@@ -179,31 +203,43 @@ The client provides detailed output for each request:
   "action": "create"
 }
 
-Running HTTP POST request 3 times to: http://localhost:5080
+Running HTTP POST request 5 times to: http://localhost:5080
+Using 3 concurrent threads
 ==================================================
 
-[Request 1/3]
+[Request 1/5]
 ✅ Status: 200
 📄 Response Body: {"status": "success", "message": "Data received"}
 ⏱️  Duration: 245.123ms
 
-[Request 2/3]
+[Request 3/5]
 ✅ Status: 200
 📄 Response Body: {"status": "success", "message": "Data received"}
 ⏱️  Duration: 198.456ms
 
-[Request 3/3]
+[Request 4/5]
 ✅ Status: 200
 📄 Response Body: {"status": "success", "message": "Data received"}
 ⏱️  Duration: 212.789ms
 
+[Request 2/5]
+✅ Status: 200
+📄 Response Body: {"status": "success", "message": "Data received"}
+⏱️  Duration: 189.234ms
+
+[Request 5/5]
+✅ Status: 200
+📄 Response Body: {"status": "success", "message": "Data received"}
+⏱️  Duration: 201.567ms
+
 ==================================================
 📊 Summary:
-   Total Requests: 3
-   Successful: 3
+   Total Requests: 5
+   Concurrent Threads: 3
+   Successful: 5
    Failed: 0
-   Total Duration: 656.368ms
-   Average Duration: 218.789ms
+   Total Duration: 1.047169s
+   Average Duration: 209.433ms
 ```
 
 ## Error Handling
@@ -236,9 +272,11 @@ Each request is timed from start to finish, including:
 
 ### Multiple Execution
 When running multiple times:
-- Each request is executed sequentially
-- A small delay (100ms) is added between requests to be respectful to the server
-- Comprehensive statistics are provided at the end
+- **Sequential execution** (default): Each request is executed one after another
+- **Concurrent execution**: When using `-threads > 1`, requests are executed in parallel using goroutines
+- **Thread safety**: All shared resources are protected with mutexes to prevent race conditions
+- **Performance**: Concurrent execution significantly reduces total execution time
+- **Comprehensive statistics**: Detailed summary including thread count and timing information
 
 ### Custom Headers
 You can add custom headers using the `-header` flag. The format is `key:value`.
@@ -246,6 +284,22 @@ You can add custom headers using the `-header` flag. The format is `key:value`.
 ### Multiple Records
 - **Single record**: Sends one JSON object per request
 - **Multiple records**: Sends an array of JSON objects per request
+
+### Multi-Threading
+The client supports concurrent execution using Go goroutines:
+
+- **Thread Count**: Use `-threads N` to specify the number of concurrent threads (default: 1)
+- **Work Distribution**: Requests are distributed evenly among available threads using a work channel
+- **Thread Safety**: Each thread gets its own copy of the HTTP client to avoid race conditions
+- **Synchronization**: Shared counters and statistics are protected with mutexes
+- **Performance**: Concurrent execution can significantly improve throughput for multiple requests
+- **Validation**: Thread count is validated (minimum 1, warning for >100 threads)
+
+**Performance Tips:**
+- Start with a small number of threads (2-5) and increase based on server capacity
+- Monitor server response times and error rates when increasing thread count
+- Consider network bandwidth and server limits when choosing thread count
+- Use `-threads 1` for sequential execution when testing or debugging
 
 ## Building
 
