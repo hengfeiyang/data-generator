@@ -1,3 +1,3 @@
-module data-generator
+module github.com/hengfeiyang/data-generator
 
-go 1.24.4
+go 1.22.2
