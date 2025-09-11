@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // HTTPClient represents the HTTP client configuration
@@ -179,7 +181,7 @@ func generateRandomData(fieldCount int, enableBody bool) map[string]interface{} 
 
 	// Always include timestamp
 	data["timestamp"] = time.Now().Format(time.RFC3339)
-	data["request_id"] = generateRandomString(16)
+	data["request_id"] = uuid.Must(uuid.NewV7()).String()
 
 	// Generate additional random fields (all single values, no arrays)
 	fieldNames := []string{"user_id", "session_id", "action", "resource", "category", "priority", "level", "source", "target", "metadata"}
@@ -192,9 +194,9 @@ func generateRandomData(fieldCount int, enableBody bool) map[string]interface{} 
 
 		switch fieldType {
 		case 0: // string
-			data[fieldName] = generateRandomString(rand.Intn(20) + 5)
+			data[fieldName] = generateRandomString(rand.Intn(32) + 5)
 		case 1: // number
-			data[fieldName] = rand.Intn(10000)
+			data[fieldName] = rand.Intn(1000000)
 		case 2: // boolean
 			data[fieldName] = rand.Intn(2) == 1
 		}
