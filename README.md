@@ -12,6 +12,7 @@ A Go HTTP client that can post JSON data with HTTP basic authentication, print e
 - ✅ Multiple execution support
 - ✅ **Multi-threading support** for concurrent requests
 - ✅ Custom headers support
+- ✅ Configurable HTTP client timeout
 - ✅ **Auto-generate JSON data** with configurable fields
 - ✅ **Generate multiple records per request**
 - ✅ **Generate nginx-like log data**
@@ -45,6 +46,9 @@ go run main.go -times 5
 # Run with multiple threads for faster execution
 go run main.go -times 10 -threads 5
 
+# Custom timeout (e.g. 1 minute for slow endpoints)
+go run main.go -url "https://httpbin.org/post" -timeout 1m
+
 # Complete example with auto-generated data and multi-threading
 go run main.go -url "https://httpbin.org/post" \
   -user "myuser" \
@@ -76,6 +80,7 @@ go run main.go -url "https://httpbin.org/post" \
 | `-pass` | Password for basic auth | `Complexpass#123` | No |
 | `-times` | Number of times to run the request | `1` | No |
 | `-threads` | Number of concurrent threads to use | `1` | No |
+| `-timeout` | HTTP client timeout (e.g. 30s, 1m) | `30s` | No |
 | `-data` | JSON data to send (leave empty to auto-generate) | `""` | No |
 | `-header` | Additional header in format 'key:value' | `""` | No |
 | `-fields` | Number of fields to generate in auto-generated data | `5` | No |
@@ -127,7 +132,16 @@ go run main.go -data '{"api_version": "v2"}' \
 go run main.go -url "https://httpbin.org/post" -data '{"message": "Hello"}'
 ```
 
-#### 7. Enable Body Field with Random Size
+#### 7. Configurable Timeout
+```bash
+# Use 1 minute timeout for slow endpoints
+go run main.go -url "https://httpbin.org/delay/45" -timeout 1m
+
+# Use 5 seconds for quick responses
+go run main.go -url "https://httpbin.org/post" -timeout 5s
+```
+
+#### 8. Enable Body Field with Random Size
 ```bash
 # Enable body field with random size (1KB-500KB)
 go run main.go -body
@@ -146,7 +160,7 @@ go run main.go -url "https://httpbin.org/post" \
   -threads 3
 ```
 
-#### 8. Multi-Threading Examples
+#### 9. Multi-Threading Examples
 ```bash
 # High-performance load testing with 20 concurrent threads
 go run main.go -url "https://httpbin.org/post" -times 100 -threads 20

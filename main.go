@@ -25,6 +25,7 @@ type HTTPClient struct {
 	Password string
 	Data     interface{}
 	Headers  map[string]string
+	Timeout  time.Duration
 }
 
 // Response represents the HTTP response
@@ -59,13 +60,14 @@ type DataGenerator struct {
 }
 
 // NewHTTPClient creates a new HTTP client instance
-func NewHTTPClient(url, username, password string, data interface{}) *HTTPClient {
+func NewHTTPClient(url, username, password string, data interface{}, timeout time.Duration) *HTTPClient {
 	return &HTTPClient{
 		URL:      url,
 		Username: username,
 		Password: password,
 		Data:     data,
 		Headers:  make(map[string]string),
+		Timeout:  timeout,
 	}
 }
 
@@ -257,8 +259,12 @@ func (c *HTTPClient) PostJSON() Response {
 	}
 
 	// Send request
+	timeout := c.Timeout
+	if timeout == 0 {
+		timeout = 30 * time.Second
+	}
 	client := &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: timeout,
 	}
 
 	resp, err := client.Do(req)
@@ -320,6 +326,7 @@ func (c *HTTPClient) RunMultiple(times int, threads int, generator *DataGenerato
 					Username: c.Username,
 					Password: c.Password,
 					Headers:  make(map[string]string),
+					Timeout:  c.Timeout,
 				}
 
 				// Copy headers
@@ -386,6 +393,7 @@ func main() {
 		password      = flag.String("pass", "Complexpass#123", "Password for basic auth")
 		times         = flag.Int("times", 1, "Number of times to run the request")
 		threads       = flag.Int("threads", 1, "Number of concurrent threads to use")
+		timeout       = flag.Duration("timeout", 30*time.Second, "HTTP client timeout (e.g. 30s, 1m)")
 		data          = flag.String("data", "", "JSON data to send (leave empty to auto-generate)")
 		header        = flag.String("header", "", "Additional header in format 'key:value' (can be used multiple times)")
 		fieldCount    = flag.Int("fields", 5, "Number of fields to generate in auto-generated data")
@@ -427,7 +435,7 @@ func main() {
 	}
 
 	// Create HTTP client
-	client := NewHTTPClient(*url, *username, *password, jsonData)
+	client := NewHTTPClient(*url, *username, *password, jsonData, *timeout)
 
 	// Add custom headers
 	if *header != "" {
