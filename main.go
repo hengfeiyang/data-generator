@@ -388,7 +388,7 @@ func main() {
 
 	// Command line flags
 	var (
-		url           = flag.String("url", "http://localhost:5080", "Target URL for POST request")
+		url           = flag.String("url", "http://localhost:5080/api/default/default/_json", "Target URL for POST request")
 		username      = flag.String("user", "root@example.com", "Username for basic auth")
 		password      = flag.String("pass", "Complexpass#123", "Password for basic auth")
 		times         = flag.Int("times", 1, "Number of times to run the request")

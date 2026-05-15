@@ -75,7 +75,7 @@ go run main.go -url "https://httpbin.org/post" \
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-url` | Target URL for POST request | `http://localhost:5080` | No |
+| `-url` | Target URL for POST request | `http://localhost:5080/api/default/default/_json` | No |
 | `-user` | Username for basic auth | `root@example.com` | No |
 | `-pass` | Password for basic auth | `Complexpass#123` | No |
 | `-times` | Number of times to run the request | `1` | No |
@@ -217,7 +217,7 @@ The client provides detailed output for each request:
   "action": "create"
 }
 
-Running HTTP POST request 5 times to: http://localhost:5080
+Running HTTP POST request 5 times to: http://localhost:5080/api/default/default/_json
 Using 3 concurrent threads
 ==================================================
 
