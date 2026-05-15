@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -57,6 +58,23 @@ type DataGenerator struct {
 	FieldCount    int
 	RecordsPerReq int
 	EnableBody    bool
+	// Hours spreads record timestamps across N past hours so each record falls
+	// into a distinct O2 hour partition. When <= 1, all records use "now".
+	Hours int
+}
+
+// IngestConfig describes how to build a per-request O2 ingest URL.
+type IngestConfig struct {
+	BaseURL      string
+	Org          string
+	StreamPrefix string
+	StreamCount  int
+}
+
+// URLFor returns the ingest URL for the Nth request (1-based).
+func (ic *IngestConfig) URLFor(requestNum int) string {
+	idx := (requestNum - 1) % ic.StreamCount
+	return fmt.Sprintf("%s/api/%s/%s_%d/_json", ic.BaseURL, ic.Org, ic.StreamPrefix, idx)
 }
 
 // NewHTTPClient creates a new HTTP client instance
@@ -143,9 +161,8 @@ func generateRandomBody(sizeKB int) string {
 	return base64.StdEncoding.EncodeToString(randomData)
 }
 
-// generateLogRecord generates a single log record
-func generateLogRecord(enableBody bool) LogRecord {
-	now := time.Now()
+// generateLogRecord generates a single log record at the given timestamp.
+func generateLogRecord(now time.Time, enableBody bool) LogRecord {
 	log := LogRecord{
 		Timestamp:   now.Format(time.RFC3339),
 		IP:          generateRandomIP(),
@@ -172,17 +189,20 @@ func generateLogRecord(enableBody bool) LogRecord {
 }
 
 // generateRandomData generates random JSON data with specified number of fields
-func generateRandomData(fieldCount int, enableBody bool) map[string]interface{} {
+// at the given timestamp. The "_timestamp" field (microseconds since epoch) is
+// O2's partition key — that's what drives which hour bucket the record lands in.
+func generateRandomData(fieldCount int, enableBody bool, now time.Time) map[string]interface{} {
 	data := make(map[string]interface{})
 	// Generate log record as the base data
-	log := generateLogRecord(enableBody)
+	log := generateLogRecord(now, enableBody)
 	// Add log record to data as a string
 	if logBytes, err := json.Marshal(log); err == nil {
 		data["message"] = string(logBytes)
 	}
 
-	// Always include timestamp
-	data["timestamp"] = time.Now().Format(time.RFC3339)
+	// O2 partition key (microseconds) and human-readable timestamp.
+	data["_timestamp"] = now.UnixMicro()
+	data["timestamp"] = now.Format(time.RFC3339)
 	data["request_id"] = uuid.Must(uuid.NewV7()).String()
 
 	// Generate additional random fields (all single values, no arrays)
@@ -207,18 +227,31 @@ func generateRandomData(fieldCount int, enableBody bool) map[string]interface{} 
 	return data
 }
 
+// timestampForRecord returns the timestamp for the i-th record in a request.
+// Records are spread deterministically across [now-Hours*1h, now], one per hour,
+// so a single request to a stream can fill all hour buckets at once.
+func (dg *DataGenerator) timestampForRecord(idx int) time.Time {
+	now := time.Now()
+	if dg.Hours <= 1 {
+		return now
+	}
+	hourOffset := idx % dg.Hours
+	// Random jitter within the hour so records aren't all on the boundary.
+	jitter := time.Duration(rand.Int63n(int64(time.Hour)))
+	return now.Add(-time.Duration(hourOffset) * time.Hour).Add(-jitter)
+}
+
 // GenerateData generates JSON data based on the generator configuration
 func (dg *DataGenerator) GenerateData() interface{} {
 	if dg.RecordsPerReq == 1 {
-		return generateRandomData(dg.FieldCount, dg.EnableBody)
-	} else {
-		// Generate multiple records
-		records := make([]map[string]interface{}, dg.RecordsPerReq)
-		for i := 0; i < dg.RecordsPerReq; i++ {
-			records[i] = generateRandomData(dg.FieldCount, dg.EnableBody)
-		}
-		return records
+		return generateRandomData(dg.FieldCount, dg.EnableBody, dg.timestampForRecord(0))
 	}
+	// Generate multiple records, each at a different hour offset.
+	records := make([]map[string]interface{}, dg.RecordsPerReq)
+	for i := 0; i < dg.RecordsPerReq; i++ {
+		records[i] = generateRandomData(dg.FieldCount, dg.EnableBody, dg.timestampForRecord(i))
+	}
+	return records
 }
 
 // PostJSON sends a POST request with JSON data and basic auth
@@ -293,25 +326,66 @@ func (c *HTTPClient) PostJSON() Response {
 	}
 }
 
-// RunMultiple executes the POST request multiple times with optional concurrent execution
-func (c *HTTPClient) RunMultiple(times int, threads int, generator *DataGenerator) {
-	fmt.Printf("Running HTTP POST request %d times to: %s\n", times, c.URL)
+// RunMultiple executes the POST request multiple times with optional concurrent execution.
+// When ingestCfg is non-nil, each request's URL is derived from it (stream rotation).
+// Otherwise c.URL is used as a fixed target.
+func (c *HTTPClient) RunMultiple(times int, threads int, generator *DataGenerator, ingestCfg *IngestConfig) {
+	if ingestCfg != nil {
+		fmt.Printf("Running %d requests across %d stream(s) at %s/api/%s/%s_*/_json\n",
+			times, ingestCfg.StreamCount, ingestCfg.BaseURL, ingestCfg.Org, ingestCfg.StreamPrefix)
+	} else {
+		fmt.Printf("Running %d requests to %s\n", times, c.URL)
+	}
 	if threads > 1 {
 		fmt.Printf("Using %d concurrent threads\n", threads)
 	}
-	fmt.Println("=" + strings.Repeat("=", 50))
+	if generator != nil && generator.Hours > 1 {
+		fmt.Printf("Spreading record timestamps across %d past hours\n", generator.Hours)
+	}
+	fmt.Println(strings.Repeat("=", 60))
 
-	// Shared variables for thread-safe operations
 	var (
-		totalDuration time.Duration
-		successCount  int
-		errorCount    int
-		mu            sync.Mutex
+		successCount  atomic.Int64
+		errorCount    atomic.Int64
+		totalDuration atomic.Int64 // nanoseconds
 		wg            sync.WaitGroup
 	)
 
 	// Channel to distribute work among goroutines
-	workChan := make(chan int, times)
+	workChan := make(chan int, threads*4)
+
+	// Periodic progress ticker — replaces per-request stdout, which dominates
+	// runtime at 1M+ requests.
+	tickerDone := make(chan struct{})
+	go func() {
+		t := time.NewTicker(2 * time.Second)
+		defer t.Stop()
+		start := time.Now()
+		var lastTotal int64
+		for {
+			select {
+			case <-tickerDone:
+				return
+			case <-t.C:
+				s := successCount.Load()
+				e := errorCount.Load()
+				total := s + e
+				elapsed := time.Since(start).Seconds()
+				windowRate := float64(total-lastTotal) / 2.0
+				avgRate := 0.0
+				if elapsed > 0 {
+					avgRate = float64(total) / elapsed
+				}
+				pct := 0.0
+				if times > 0 {
+					pct = float64(total) / float64(times) * 100
+				}
+				fmt.Printf("[%6s] %d/%d (%.1f%%)  ok=%d err=%d  %.0f req/s (avg %.0f)\n",
+					time.Since(start).Round(time.Second), total, times, pct, s, e, windowRate, avgRate)
+				lastTotal = total
+			}
+		}
+	}()
 
 	// Start worker goroutines
 	for i := 0; i < threads; i++ {
@@ -328,6 +402,9 @@ func (c *HTTPClient) RunMultiple(times int, threads int, generator *DataGenerato
 					Headers:  make(map[string]string),
 					Timeout:  c.Timeout,
 				}
+				if ingestCfg != nil {
+					clientCopy.URL = ingestCfg.URLFor(requestNum)
+				}
 
 				// Copy headers
 				for k, v := range c.Headers {
@@ -343,22 +420,29 @@ func (c *HTTPClient) RunMultiple(times int, threads int, generator *DataGenerato
 
 				resp := clientCopy.PostJSON()
 
-				// Thread-safe update of counters and duration
-				mu.Lock()
+				totalDuration.Add(int64(resp.Duration))
 				if resp.Error != nil {
-					errorCount++
-					fmt.Printf("\n[Request %d/%d] ❌ Error: %v\n", requestNum, times, resp.Error)
+					errorCount.Add(1)
+					// Only print the first few errors per worker to surface
+					// problems without flooding stdout.
+					if errorCount.Load() <= 5 {
+						fmt.Printf("[worker %d] error on req %d (%s): %v\n",
+							workerID, requestNum, clientCopy.URL, resp.Error)
+					}
+				} else if resp.StatusCode >= 400 {
+					errorCount.Add(1)
+					if errorCount.Load() <= 5 {
+						fmt.Printf("[worker %d] HTTP %d on req %d (%s): %s\n",
+							workerID, resp.StatusCode, requestNum, clientCopy.URL, truncate(resp.Body, 200))
+					}
 				} else {
-					successCount++
-					fmt.Printf("\n[Request %d/%d] ✅ Status: %d\n", requestNum, times, resp.StatusCode)
-					fmt.Printf("📄 Response Body: %s\n", resp.Body)
+					successCount.Add(1)
 				}
-				fmt.Printf("⏱️  Duration: %v\n", resp.Duration)
-				totalDuration += resp.Duration
-				mu.Unlock()
 			}
 		}(i)
 	}
+
+	wallStart := time.Now()
 
 	// Send work to the channel
 	for i := 1; i <= times; i++ {
@@ -368,18 +452,34 @@ func (c *HTTPClient) RunMultiple(times int, threads int, generator *DataGenerato
 
 	// Wait for all goroutines to complete
 	wg.Wait()
+	close(tickerDone)
+
+	wallElapsed := time.Since(wallStart)
+	s := successCount.Load()
+	e := errorCount.Load()
+	td := time.Duration(totalDuration.Load())
 
 	// Print summary
-	fmt.Println("\n" + strings.Repeat("=", 50))
-	fmt.Printf("📊 Summary:\n")
-	fmt.Printf("   Total Requests: %d\n", times)
+	fmt.Println(strings.Repeat("=", 60))
+	fmt.Printf("Summary:\n")
+	fmt.Printf("   Total Requests:     %d\n", times)
 	fmt.Printf("   Concurrent Threads: %d\n", threads)
-	fmt.Printf("   Successful: %d\n", successCount)
-	fmt.Printf("   Failed: %d\n", errorCount)
-	fmt.Printf("   Total Duration: %v\n", totalDuration)
-	if times > 0 {
-		fmt.Printf("   Average Duration: %v\n", totalDuration/time.Duration(times))
+	fmt.Printf("   Successful:         %d\n", s)
+	fmt.Printf("   Failed:             %d\n", e)
+	fmt.Printf("   Wall Time:          %s\n", wallElapsed.Round(time.Millisecond))
+	if wallElapsed > 0 {
+		fmt.Printf("   Throughput:         %.0f req/s\n", float64(times)/wallElapsed.Seconds())
 	}
+	if times > 0 {
+		fmt.Printf("   Avg Request:        %s\n", (td / time.Duration(times)).Round(time.Microsecond))
+	}
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 func main() {
@@ -388,59 +488,73 @@ func main() {
 
 	// Command line flags
 	var (
-		url           = flag.String("url", "http://localhost:5080/api/default/default/_json", "Target URL for POST request")
+		baseURL       = flag.String("url", "http://localhost:5080", "Base URL (scheme://host:port) for the O2 ingest endpoint")
+		org           = flag.String("org", "default", "O2 organization name")
+		streamPrefix  = flag.String("stream-prefix", "stream", "Stream name prefix (streams will be <prefix>_0, <prefix>_1, ...)")
+		streams       = flag.Int("streams", 1, "Number of distinct streams to write to")
+		hours         = flag.Int("hours", 1, "Spread record timestamps across N past hours (one record per hour per request)")
 		username      = flag.String("user", "root@example.com", "Username for basic auth")
 		password      = flag.String("pass", "Complexpass#123", "Password for basic auth")
-		times         = flag.Int("times", 1, "Number of times to run the request")
-		threads       = flag.Int("threads", 1, "Number of concurrent threads to use")
+		times         = flag.Int("times", 1, "Number of HTTP requests to send")
+		threads       = flag.Int("threads", 1, "Number of concurrent threads")
 		timeout       = flag.Duration("timeout", 30*time.Second, "HTTP client timeout (e.g. 30s, 1m)")
 		data          = flag.String("data", "", "JSON data to send (leave empty to auto-generate)")
-		header        = flag.String("header", "", "Additional header in format 'key:value' (can be used multiple times)")
+		header        = flag.String("header", "", "Additional header in format 'key:value'")
 		fieldCount    = flag.Int("fields", 5, "Number of fields to generate in auto-generated data")
 		recordsPerReq = flag.Int("records", 1, "Number of records per request")
 		enableBody    = flag.Bool("body", false, "Enable body field with random size (1KB-200KB)")
+		rawURL        = flag.String("raw-url", "", "If set, post to this exact URL instead of building from -url/-org/-stream-prefix (disables stream rotation)")
 	)
 	flag.Parse()
 
 	// Validate required parameters
-	if *url == "" {
-		fmt.Println("❌ Error: URL is required")
-		fmt.Println("Usage: go run main.go -url <target_url> [options]")
+	if *baseURL == "" && *rawURL == "" {
+		fmt.Println("Error: -url is required")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
 
-	// Validate threads parameter
 	if *threads < 1 {
-		fmt.Println("❌ Error: threads must be at least 1")
+		fmt.Println("Error: threads must be at least 1")
 		os.Exit(1)
 	}
-	if *threads > 100 {
-		fmt.Println("⚠️  Warning: Using more than 100 threads may cause performance issues")
+	if *streams < 1 {
+		fmt.Println("Error: streams must be at least 1")
+		os.Exit(1)
+	}
+	if *hours < 1 {
+		fmt.Println("Error: hours must be at least 1")
+		os.Exit(1)
 	}
 
 	var jsonData interface{}
-
-	// Check if we should auto-generate data or use provided data
 	if *data == "" {
-		// For auto-generated data, we'll generate it in RunMultiple
 		jsonData = nil
-		fmt.Printf("🔄 Will auto-generate new data for each request\n\n")
+		fmt.Printf("Auto-generating data for each request\n")
 	} else {
-		// Parse provided JSON data
 		if err := json.Unmarshal([]byte(*data), &jsonData); err != nil {
-			fmt.Printf("❌ Error: Invalid JSON data: %v\n", err)
+			fmt.Printf("Error: Invalid JSON data: %v\n", err)
 			os.Exit(1)
 		}
 	}
 
-	// Create HTTP client
-	client := NewHTTPClient(*url, *username, *password, jsonData, *timeout)
+	// Decide URL strategy: raw URL (no rotation) vs O2 ingest builder.
+	var ingestCfg *IngestConfig
+	fixedURL := ""
+	if *rawURL != "" {
+		fixedURL = *rawURL
+	} else {
+		ingestCfg = &IngestConfig{
+			BaseURL:      strings.TrimRight(*baseURL, "/"),
+			Org:          *org,
+			StreamPrefix: *streamPrefix,
+			StreamCount:  *streams,
+		}
+	}
 
-	// Add custom headers
+	client := NewHTTPClient(fixedURL, *username, *password, jsonData, *timeout)
+
 	if *header != "" {
-		// For simplicity, we'll just add one header
-		// In a more complex implementation, you could parse multiple headers
 		parts := strings.SplitN(*header, ":", 2)
 		if len(parts) == 2 {
 			client.AddHeader(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
@@ -449,15 +563,14 @@ func main() {
 
 	// Run the requests
 	if *data == "" {
-		// Auto-generate data for each request
 		generator := &DataGenerator{
 			FieldCount:    *fieldCount,
 			RecordsPerReq: *recordsPerReq,
 			EnableBody:    *enableBody,
+			Hours:         *hours,
 		}
-		client.RunMultiple(*times, *threads, generator)
+		client.RunMultiple(*times, *threads, generator, ingestCfg)
 	} else {
-		// Use provided data (same data for all requests)
-		client.RunMultiple(*times, *threads, nil)
+		client.RunMultiple(*times, *threads, nil, ingestCfg)
 	}
 }
