@@ -319,7 +319,7 @@ Each request is timed from start to finish, including:
 When running multiple times:
 - **Sequential execution** (default): Each request is executed one after another
 - **Concurrent execution**: When using `-threads > 1`, requests are executed in parallel using goroutines
-- **Thread safety**: All shared resources are protected with mutexes to prevent race conditions
+- **Thread safety**: Shared counters use `sync/atomic`; each worker holds its own per-request client copy
 - **Performance**: Concurrent execution significantly reduces total execution time
 - **Comprehensive statistics**: Detailed summary including thread count and timing information
 
@@ -336,9 +336,9 @@ The client supports concurrent execution using Go goroutines:
 - **Thread Count**: Use `-threads N` to specify the number of concurrent threads (default: 1)
 - **Work Distribution**: Requests are distributed evenly among available threads using a work channel
 - **Thread Safety**: Each thread gets its own copy of the HTTP client to avoid race conditions
-- **Synchronization**: Shared counters and statistics are protected with mutexes
+- **Synchronization**: Shared counters use `sync/atomic` (no lock contention on the hot path)
 - **Performance**: Concurrent execution can significantly improve throughput for multiple requests
-- **Validation**: Thread count is validated (minimum 1, warning for >100 threads)
+- **Validation**: Thread count is validated (minimum 1)
 
 **Performance Tips:**
 - Start with a small number of threads (2-5) and increase based on server capacity
