@@ -91,6 +91,7 @@ go run main.go -raw-url "https://httpbin.org/post" \
 | `-fields` | Number of fields to generate in auto-generated data | `5` |
 | `-records` | Number of records per request | `1` |
 | `-body` | Enable body field with random size (1KB-500KB) | `false` |
+| `-trace_id` | Generate a `trace_id` (32-char lowercase hex, W3C trace context) on each record | `false` |
 
 ## OpenObserve: generating many files
 
@@ -245,6 +246,7 @@ The data generates random JSON data with these field types:
 - **timestamp**: Same time, RFC3339 string for human readability
 - **request_id**: UUIDv7
 - **message**: JSON-encoded nginx-style log record (see below)
+- **trace_id**: 32-char lowercase hex string (W3C trace context format) — only included when `-trace_id` flag is enabled
 - Plus `-fields` − 3 additional fields named `<name><i>` (e.g. `user_id0`, `session_id1`, …), each a random string, number, or boolean
 
 Also include a `message` field that is a json struct include these fields:

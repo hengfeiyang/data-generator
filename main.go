@@ -58,6 +58,7 @@ type DataGenerator struct {
 	FieldCount    int
 	RecordsPerReq int
 	EnableBody    bool
+	EnableTraceID bool
 	// Hours spreads record timestamps across N past hours so each record falls
 	// into a distinct O2 hour partition. When <= 1, all records use "now".
 	Hours int
@@ -142,6 +143,15 @@ func generateRandomReferer() string {
 	return domains[rand.Intn(len(domains))]
 }
 
+// generateTraceID returns a W3C trace context trace-id (32 lowercase hex chars).
+func generateTraceID() string {
+	var b [16]byte
+	for i := range b {
+		b[i] = byte(rand.Intn(256))
+	}
+	return fmt.Sprintf("%x", b[:])
+}
+
 // generateRandomBody generates random binary data and returns it as base64 encoded string
 func generateRandomBody(sizeKB int) string {
 	if sizeKB == 0 {
@@ -191,7 +201,7 @@ func generateLogRecord(now time.Time, enableBody bool) LogRecord {
 // generateRandomData generates random JSON data with specified number of fields
 // at the given timestamp. The "_timestamp" field (microseconds since epoch) is
 // O2's partition key — that's what drives which hour bucket the record lands in.
-func generateRandomData(fieldCount int, enableBody bool, now time.Time) map[string]interface{} {
+func generateRandomData(fieldCount int, enableBody, enableTraceID bool, now time.Time) map[string]interface{} {
 	data := make(map[string]interface{})
 	// Generate log record as the base data
 	log := generateLogRecord(now, enableBody)
@@ -204,6 +214,9 @@ func generateRandomData(fieldCount int, enableBody bool, now time.Time) map[stri
 	data["_timestamp"] = now.UnixMicro()
 	data["timestamp"] = now.Format(time.RFC3339)
 	data["request_id"] = uuid.Must(uuid.NewV7()).String()
+	if enableTraceID {
+		data["trace_id"] = generateTraceID()
+	}
 
 	// Generate additional random fields (all single values, no arrays)
 	fieldNames := []string{"user_id", "session_id", "action", "resource", "category", "priority", "level", "source", "target", "metadata"}
@@ -244,12 +257,12 @@ func (dg *DataGenerator) timestampForRecord(idx int) time.Time {
 // GenerateData generates JSON data based on the generator configuration
 func (dg *DataGenerator) GenerateData() interface{} {
 	if dg.RecordsPerReq == 1 {
-		return generateRandomData(dg.FieldCount, dg.EnableBody, dg.timestampForRecord(0))
+		return generateRandomData(dg.FieldCount, dg.EnableBody, dg.EnableTraceID, dg.timestampForRecord(0))
 	}
 	// Generate multiple records, each at a different hour offset.
 	records := make([]map[string]interface{}, dg.RecordsPerReq)
 	for i := 0; i < dg.RecordsPerReq; i++ {
-		records[i] = generateRandomData(dg.FieldCount, dg.EnableBody, dg.timestampForRecord(i))
+		records[i] = generateRandomData(dg.FieldCount, dg.EnableBody, dg.EnableTraceID, dg.timestampForRecord(i))
 	}
 	return records
 }
@@ -503,6 +516,7 @@ func main() {
 		fieldCount    = flag.Int("fields", 5, "Number of fields to generate in auto-generated data")
 		recordsPerReq = flag.Int("records", 1, "Number of records per request")
 		enableBody    = flag.Bool("body", false, "Enable body field with random size (1KB-200KB)")
+		enableTraceID = flag.Bool("trace_id", false, "Generate a trace_id (32-char hex) for each record")
 		rawURL        = flag.String("raw-url", "", "If set, post to this exact URL instead of building from -url/-org/-stream-prefix (disables stream rotation)")
 	)
 	flag.Parse()
@@ -567,6 +581,7 @@ func main() {
 			FieldCount:    *fieldCount,
 			RecordsPerReq: *recordsPerReq,
 			EnableBody:    *enableBody,
+			EnableTraceID: *enableTraceID,
 			Hours:         *hours,
 		}
 		client.RunMultiple(*times, *threads, generator, ingestCfg)
