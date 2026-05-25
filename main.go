@@ -59,6 +59,9 @@ type DataGenerator struct {
 	RecordsPerReq int
 	EnableBody    bool
 	EnableTraceID bool
+	// FlatMessage merges the LogRecord fields directly into the top-level record
+	// instead of JSON-encoding them into a single "message" string.
+	FlatMessage bool
 	// Hours spreads record timestamps across N past hours so each record falls
 	// into a distinct O2 hour partition. When <= 1, all records use "now".
 	Hours int
@@ -201,12 +204,24 @@ func generateLogRecord(now time.Time, enableBody bool) LogRecord {
 // generateRandomData generates random JSON data with specified number of fields
 // at the given timestamp. The "_timestamp" field (microseconds since epoch) is
 // O2's partition key — that's what drives which hour bucket the record lands in.
-func generateRandomData(fieldCount int, enableBody, enableTraceID bool, now time.Time) map[string]interface{} {
+func generateRandomData(fieldCount int, enableBody, enableTraceID, flatMessage bool, now time.Time) map[string]interface{} {
 	data := make(map[string]interface{})
 	// Generate log record as the base data
 	log := generateLogRecord(now, enableBody)
-	// Add log record to data as a string
-	if logBytes, err := json.Marshal(log); err == nil {
+	if flatMessage {
+		// Merge log record fields directly into the top-level record instead of
+		// nesting them under a "message" string. Round-trip through JSON so the
+		// LogRecord json tags (and omitempty for Body) are honored.
+		if logBytes, err := json.Marshal(log); err == nil {
+			var logMap map[string]interface{}
+			if json.Unmarshal(logBytes, &logMap) == nil {
+				for k, v := range logMap {
+					data[k] = v
+				}
+			}
+		}
+	} else if logBytes, err := json.Marshal(log); err == nil {
+		// Add log record to data as a string
 		data["message"] = string(logBytes)
 	}
 
@@ -257,12 +272,12 @@ func (dg *DataGenerator) timestampForRecord(idx int) time.Time {
 // GenerateData generates JSON data based on the generator configuration
 func (dg *DataGenerator) GenerateData() interface{} {
 	if dg.RecordsPerReq == 1 {
-		return generateRandomData(dg.FieldCount, dg.EnableBody, dg.EnableTraceID, dg.timestampForRecord(0))
+		return generateRandomData(dg.FieldCount, dg.EnableBody, dg.EnableTraceID, dg.FlatMessage, dg.timestampForRecord(0))
 	}
 	// Generate multiple records, each at a different hour offset.
 	records := make([]map[string]interface{}, dg.RecordsPerReq)
 	for i := 0; i < dg.RecordsPerReq; i++ {
-		records[i] = generateRandomData(dg.FieldCount, dg.EnableBody, dg.EnableTraceID, dg.timestampForRecord(i))
+		records[i] = generateRandomData(dg.FieldCount, dg.EnableBody, dg.EnableTraceID, dg.FlatMessage, dg.timestampForRecord(i))
 	}
 	return records
 }
@@ -517,6 +532,7 @@ func main() {
 		recordsPerReq = flag.Int("records", 1, "Number of records per request")
 		enableBody    = flag.Bool("body", false, "Enable body field with random size (1KB-200KB)")
 		enableTraceID = flag.Bool("trace_id", false, "Generate a trace_id (32-char hex) for each record")
+		flatMessage   = flag.Bool("flat", false, "Merge log record fields into the top-level record instead of a 'message' JSON string")
 		rawURL        = flag.String("raw-url", "", "If set, post to this exact URL instead of building from -url/-org/-stream-prefix (disables stream rotation)")
 	)
 	flag.Parse()
@@ -582,6 +598,7 @@ func main() {
 			RecordsPerReq: *recordsPerReq,
 			EnableBody:    *enableBody,
 			EnableTraceID: *enableTraceID,
+			FlatMessage:   *flatMessage,
 			Hours:         *hours,
 		}
 		client.RunMultiple(*times, *threads, generator, ingestCfg)

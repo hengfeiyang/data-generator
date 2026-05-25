@@ -92,6 +92,7 @@ go run main.go -raw-url "https://httpbin.org/post" \
 | `-records` | Number of records per request | `1` |
 | `-body` | Enable body field with random size (1KB-500KB) | `false` |
 | `-trace_id` | Generate a `trace_id` (32-char lowercase hex, W3C trace context) on each record | `false` |
+| `-flat` | Merge the log record fields into the top-level record instead of a `message` JSON string | `false` |
 
 ## OpenObserve: generating many files
 
@@ -226,7 +227,16 @@ go run main.go -raw-url "https://httpbin.org/post" \
   -threads 3
 ```
 
-#### 9. Multi-Threading Examples
+#### 9. Flatten Log Fields to Top Level
+```bash
+# Log record fields become top-level keys instead of a "message" string
+go run main.go -flat
+
+# Combine with trace_id and extra fields
+go run main.go -flat -trace_id -fields 8 -records 3
+```
+
+#### 10. Multi-Threading Examples
 ```bash
 # High-performance load testing with 20 concurrent threads
 go run main.go -raw-url "https://httpbin.org/post" -times 100 -threads 20
@@ -245,11 +255,11 @@ The data generates random JSON data with these field types:
 - **_timestamp**: Microseconds since epoch — O2's partition key (drives which hour bucket the record lands in)
 - **timestamp**: Same time, RFC3339 string for human readability
 - **request_id**: UUIDv7
-- **message**: JSON-encoded nginx-style log record (see below)
+- **message**: JSON-encoded nginx-style log record (see below). With `-flat`, the log record fields are merged into the top-level record and no `message` field is emitted.
 - **trace_id**: 32-char lowercase hex string (W3C trace context format) — only included when `-trace_id` flag is enabled
 - Plus `-fields` − 3 additional fields named `<name><i>` (e.g. `user_id0`, `session_id1`, …), each a random string, number, or boolean
 
-Also include a `message` field that is a json struct include these fields:
+The log record holds these fields (nested under `message` by default, or merged into the top-level record with `-flat`):
 - **timestamp**: Current timestamp
 - **ip**: Random IP address
 - **method**: HTTP method (GET, POST, PUT, DELETE, PATCH)
