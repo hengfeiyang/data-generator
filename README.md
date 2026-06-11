@@ -93,6 +93,7 @@ go run main.go -raw-url "https://httpbin.org/post" \
 | `-body` | Enable body field with random size (1KB-500KB) | `false` |
 | `-trace_id` | Generate a `trace_id` (32-char lowercase hex, W3C trace context) on each record | `false` |
 | `-flat` | Merge the log record fields into the top-level record instead of a `message` JSON string | `false` |
+| `-cardinality` | Override per-field max distinct values, e.g. `ip=500,trace_id=20000`. `0` = a unique value per record. See [Field cardinality](#field-cardinality). | `""` (built-in defaults) |
 
 ## OpenObserve: generating many files
 
@@ -254,24 +255,64 @@ go run main.go -raw-url "https://httpbin.org/post" -times 1000 -threads 50
 The data generates random JSON data with these field types:
 - **_timestamp**: Microseconds since epoch — O2's partition key (drives which hour bucket the record lands in)
 - **timestamp**: Same time, RFC3339 string for human readability
-- **request_id**: UUIDv7
+- **request_id**: UUIDv7 (unique per record by default)
 - **message**: JSON-encoded nginx-style log record (see below). With `-flat`, the log record fields are merged into the top-level record and no `message` field is emitted.
 - **trace_id**: 32-char lowercase hex string (W3C trace context format) — only included when `-trace_id` flag is enabled
-- Plus `-fields` − 3 additional fields named `<name><i>` (e.g. `user_id0`, `session_id1`, …), each a random string, number, or boolean
+- Plus `-fields` − 3 additional fields named `<name><i>` (e.g. `user_id0`, `session_id1`, …). Each field has a fixed type, rotating string → number → boolean.
 
 The log record holds these fields (nested under `message` by default, or merged into the top-level record with `-flat`):
 - **timestamp**: Current timestamp
-- **ip**: Random IP address
+- **ip**: Client IP address (bounded cardinality, see below)
 - **method**: HTTP method (GET, POST, PUT, DELETE, PATCH)
 - **path**: Random API path
-- **status**: HTTP status code (200, 201, 400, 401, 403, 404, 500)
+- **status**: HTTP status code, weighted like real traffic (~85% 2xx, mostly-benign 4xx, ~1% 500)
 - **bytes**: Random response size (100-10100 bytes)
 - **user_agent**: Random browser user agent
 - **referer**: Random referer URL
 - **request_time**: Random request time (0.1-2.1 seconds)
-- **remote_addr**: Random client IP
-- **server_name**: Random nginx server name
+- **remote_addr**: Client IP (bounded cardinality)
+- **server_name**: nginx server name (bounded cardinality)
 - **body**: Random base64-encoded binary data (1KB-500KB) - only included when `-body` flag is enabled
+
+### Field cardinality
+
+To simulate real-world data, repeated fields don't get a fresh random value per
+record. Instead each field is capped at a maximum number of distinct values
+(its *cardinality*), and values are drawn with a power-law skew so a few "hot"
+values dominate — like real top-talker IPs or power users. `trace_id` and
+`request_id` are the exception: when bounded, they repeat uniformly (spans of
+one trace, retries of one request) instead of having hot values.
+
+Built-in defaults:
+
+| Field | Default cardinality |
+|-------|---------------------|
+| `request_id` | `0` (unique per record) |
+| `trace_id` | `100000` (~10 log lines per trace at 1M records) |
+| `ip`, `remote_addr` | `1000` |
+| `server_name` | `50` |
+| `user_id` | `10000` |
+| `session_id` | `50000` |
+| `metadata` | `10000` |
+| `target` | `500` |
+| `resource` | `200` |
+| `source` | `100` |
+| `action` | `50` |
+| `category` | `20` |
+| `level` | `6` |
+| `priority` | `5` |
+
+Override any of them with `-cardinality` (`0` restores a unique random value
+per record):
+
+```bash
+# 500 client IPs, ~20k traces, fully-unique user ids
+go run main.go -flat -trace_id -cardinality "ip=500,trace_id=20000,user_id=0" -records 1000 -times 1000
+```
+
+Values are derived deterministically from a hashed index, so cardinality `N`
+means at most `N` distinct values no matter how many records, threads, or runs
+generate them — no value pools are held in memory.
 
 ## Output Format
 

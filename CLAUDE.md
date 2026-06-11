@@ -51,12 +51,16 @@ When changing timestamp/partition logic, keep this invariant: a single request m
 `DataGenerator.GenerateData()` returns either a single map (when `-records=1`) or a slice of maps. Each record contains:
 - `_timestamp` (microseconds since epoch) — **this is O2's partition key**, do not rename or change the unit
 - `timestamp` (RFC3339 string, same instant — human readable)
-- `request_id` (UUIDv7)
+- `request_id` (UUIDv7, unique per record by default)
 - `message` (JSON-encoded `LogRecord`, nginx-style)
 - `trace_id` (32-char lowercase hex, W3C trace context) — only present when `-trace_id` is set
-- `fields - 3` extra random fields (string/number/bool)
+- `fields - 3` extra fields, each with a fixed type rotating string/number/bool by index (`i % 3`)
 
 `LogRecord.Body` is a `*string` so it's omitted via `omitempty` when `-body` is off; the byte size is randomized 0–200KB inside `generateLogRecord` even though the flag advertises "1KB–500KB" (the README and code disagree — code wins).
+
+### Cardinality model
+
+Repeated fields (`ip`, `remote_addr`, `server_name`, `trace_id`, `user_id`, …) are bounded by `FieldCardinality` (defaults in `defaultCardinality()`, overridable via `-cardinality "field=N,..."`, `0` = unique per record). The mechanism: draw an index in `[0, N)` — power-law-skewed via `pick` so low indexes are hot, except `trace_id`/`request_id` which use `pickUniform` — then derive the value deterministically from the index by FNV hashing (`indexedHash` and friends). This keeps cardinality exact across workers and runs with no in-memory value pools and no locks; don't replace it with pre-generated pools or per-worker state. `status` is weighted (~80% 200) via `pickStatus`, not cardinality-bounded.
 
 ## Notes
 

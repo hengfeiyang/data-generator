@@ -3,13 +3,17 @@ package main
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"io"
+	"math"
 	"math/rand"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -65,6 +69,8 @@ type DataGenerator struct {
 	// Hours spreads record timestamps across N past hours so each record falls
 	// into a distinct O2 hour partition. When <= 1, all records use "now".
 	Hours int
+	// Cardinality bounds how many distinct values each field can take.
+	Cardinality FieldCardinality
 }
 
 // IngestConfig describes how to build a per-request O2 ingest URL.
@@ -174,20 +180,187 @@ func generateRandomBody(sizeKB int) string {
 	return base64.StdEncoding.EncodeToString(randomData)
 }
 
+// ---- Cardinality control ----
+//
+// Real-world log fields repeat: a fleet has a bounded set of client IPs, user
+// ids, server names, etc., usually with a few "hot" values dominating. To
+// simulate that, a bounded field draws an index in [0, cardinality) and
+// derives its value deterministically from the index by hashing. No value
+// pools are kept in memory and no locks are added to the worker hot path;
+// cardinality N means at most N distinct values regardless of record count.
+
+// FieldCardinality maps a field name to its max number of distinct values.
+// 0 means unbounded — a fresh random value per record.
+type FieldCardinality map[string]int
+
+// defaultCardinality returns per-field defaults shaped like real-world logs:
+// a small server fleet, thousands of client IPs, tens of thousands of
+// users/sessions, and ~10 log lines per trace at 1M records.
+func defaultCardinality() FieldCardinality {
+	return FieldCardinality{
+		"ip":          1000,
+		"remote_addr": 1000,
+		"server_name": 50,
+		"request_id":  0, // unique per record, like real request ids
+		"trace_id":    100000,
+		"user_id":     10000,
+		"session_id":  50000,
+		"action":      50,
+		"resource":    200,
+		"category":    20,
+		"priority":    5,
+		"level":       6,
+		"source":      100,
+		"target":      500,
+		"metadata":    10000,
+	}
+}
+
+// parseCardinality applies "field=N,field=N" overrides from -cardinality on
+// top of the defaults. N=0 restores fully-unique random values for a field.
+func parseCardinality(spec string) (FieldCardinality, error) {
+	fc := defaultCardinality()
+	if spec == "" {
+		return fc, nil
+	}
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) != 2 {
+			return nil, fmt.Errorf("invalid cardinality entry %q (want field=N)", part)
+		}
+		field := strings.TrimSpace(kv[0])
+		if _, known := fc[field]; !known {
+			return nil, fmt.Errorf("unknown cardinality field %q (valid: %s)", field, strings.Join(fc.fieldNames(), ", "))
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(kv[1]))
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("invalid cardinality value in %q (want a non-negative integer)", part)
+		}
+		fc[field] = n
+	}
+	return fc, nil
+}
+
+func (fc FieldCardinality) fieldNames() []string {
+	names := make([]string, 0, len(fc))
+	for k := range fc {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func (fc FieldCardinality) String() string {
+	parts := make([]string, 0, len(fc))
+	for _, k := range fc.fieldNames() {
+		parts = append(parts, fmt.Sprintf("%s=%d", k, fc[k]))
+	}
+	return strings.Join(parts, " ")
+}
+
+// pick draws a power-law-skewed index for the field: index 0 is the hottest
+// value (~18% of picks at cardinality 1000), with a long tail. ok is false
+// when the field is unbounded and the caller should generate a random value.
+func (fc FieldCardinality) pick(field string) (idx int, ok bool) {
+	card := fc[field]
+	if card <= 0 {
+		return 0, false
+	}
+	idx = int(float64(card) * math.Pow(rand.Float64(), 4))
+	if idx >= card {
+		idx = card - 1
+	}
+	return idx, true
+}
+
+// pickUniform is pick without the hot-value skew — for trace_id and
+// request_id, where real-world repeats (spans of one trace, retries of one
+// request) spread evenly instead of concentrating on a few hot values.
+func (fc FieldCardinality) pickUniform(field string) (idx int, ok bool) {
+	card := fc[field]
+	if card <= 0 {
+		return 0, false
+	}
+	return rand.Intn(card), true
+}
+
+// indexedHash gives a stable pseudo-random 64-bit value for (field, idx) so
+// the same index always derives the same field value, in any worker or run.
+func indexedHash(field string, idx int) uint64 {
+	h := fnv.New64a()
+	fmt.Fprintf(h, "%s/%d", field, idx)
+	return h.Sum64()
+}
+
+func indexedIP(field string, idx int) string {
+	h := indexedHash(field, idx)
+	return fmt.Sprintf("%d.%d.%d.%d", byte(h>>24), byte(h>>16), byte(h>>8), byte(h))
+}
+
+func indexedTraceID(idx int) string {
+	return fmt.Sprintf("%016x%016x", indexedHash("trace_id.lo", idx), indexedHash("trace_id.hi", idx))
+}
+
+func indexedRequestID(idx int) string {
+	var b [16]byte
+	binary.BigEndian.PutUint64(b[0:8], indexedHash("request_id.lo", idx))
+	binary.BigEndian.PutUint64(b[8:16], indexedHash("request_id.hi", idx))
+	return uuid.UUID(b).String()
+}
+
+// pickStatus returns a status code weighted like real traffic: ~85% 2xx,
+// mostly-benign 4xx, rare 5xx.
+func pickStatus() int {
+	r := rand.Intn(100)
+	switch {
+	case r < 80:
+		return 200
+	case r < 85:
+		return 201
+	case r < 93:
+		return 404
+	case r < 96:
+		return 400
+	case r < 98:
+		return 401
+	case r < 99:
+		return 403
+	default:
+		return 500
+	}
+}
+
 // generateLogRecord generates a single log record at the given timestamp.
-func generateLogRecord(now time.Time, enableBody bool) LogRecord {
+func generateLogRecord(now time.Time, enableBody bool, card FieldCardinality) LogRecord {
+	ip := generateRandomIP()
+	if idx, ok := card.pick("ip"); ok {
+		ip = indexedIP("ip", idx)
+	}
+	remoteAddr := generateRandomIP()
+	if idx, ok := card.pick("remote_addr"); ok {
+		remoteAddr = indexedIP("remote_addr", idx)
+	}
+	serverName := "nginx-server-" + generateRandomString(4)
+	if idx, ok := card.pick("server_name"); ok {
+		serverName = "nginx-server-" + strconv.Itoa(idx)
+	}
+
 	log := LogRecord{
 		Timestamp:   now.Format(time.RFC3339),
-		IP:          generateRandomIP(),
+		IP:          ip,
 		Method:      []string{"GET", "POST", "PUT", "DELETE", "PATCH"}[rand.Intn(5)],
 		Path:        generateRandomPath(),
-		Status:      []int{200, 201, 400, 401, 403, 404, 500}[rand.Intn(7)],
+		Status:      pickStatus(),
 		Bytes:       rand.Intn(10000) + 100,
 		UserAgent:   generateRandomUserAgent(),
 		Referer:     generateRandomReferer(),
 		RequestTime: rand.Float64()*2.0 + 0.1, // 0.1 to 2.1 seconds
-		RemoteAddr:  generateRandomIP(),
-		ServerName:  "nginx-server-" + generateRandomString(4),
+		RemoteAddr:  remoteAddr,
+		ServerName:  serverName,
 	}
 
 	// Only add body field if enabled, with random size between 1KB-200KB
@@ -204,10 +377,10 @@ func generateLogRecord(now time.Time, enableBody bool) LogRecord {
 // generateRandomData generates random JSON data with specified number of fields
 // at the given timestamp. The "_timestamp" field (microseconds since epoch) is
 // O2's partition key — that's what drives which hour bucket the record lands in.
-func generateRandomData(fieldCount int, enableBody, enableTraceID, flatMessage bool, now time.Time) map[string]interface{} {
+func generateRandomData(fieldCount int, enableBody, enableTraceID, flatMessage bool, card FieldCardinality, now time.Time) map[string]interface{} {
 	data := make(map[string]interface{})
 	// Generate log record as the base data
-	log := generateLogRecord(now, enableBody)
+	log := generateLogRecord(now, enableBody, card)
 	if flatMessage {
 		// Merge log record fields directly into the top-level record instead of
 		// nesting them under a "message" string. Round-trip through JSON so the
@@ -228,25 +401,42 @@ func generateRandomData(fieldCount int, enableBody, enableTraceID, flatMessage b
 	// O2 partition key (microseconds) and human-readable timestamp.
 	data["_timestamp"] = now.UnixMicro()
 	data["timestamp"] = now.Format(time.RFC3339)
-	data["request_id"] = uuid.Must(uuid.NewV7()).String()
+	if idx, ok := card.pickUniform("request_id"); ok {
+		data["request_id"] = indexedRequestID(idx)
+	} else {
+		data["request_id"] = uuid.Must(uuid.NewV7()).String()
+	}
 	if enableTraceID {
-		data["trace_id"] = generateTraceID()
+		if idx, ok := card.pickUniform("trace_id"); ok {
+			data["trace_id"] = indexedTraceID(idx)
+		} else {
+			data["trace_id"] = generateTraceID()
+		}
 	}
 
 	// Generate additional random fields (all single values, no arrays)
 	fieldNames := []string{"user_id", "session_id", "action", "resource", "category", "priority", "level", "source", "target", "metadata"}
 
 	for i := 0; i < fieldCount-3; i++ { // -3 because we already added timestamp, request_id, and message
-		fieldName := fieldNames[i%len(fieldNames)] + strconv.Itoa(i)
+		base := fieldNames[i%len(fieldNames)]
+		fieldName := base + strconv.Itoa(i)
 
-		// Randomly choose between string, number, and boolean (no arrays)
-		fieldType := rand.Intn(3) // 0=string, 1=number, 2=boolean
-
-		switch fieldType {
+		// Type is fixed per field (string, number, boolean in rotation) —
+		// real fields don't change type record to record, and bounded
+		// cardinality only makes sense on a consistently-typed column.
+		switch i % 3 {
 		case 0: // string
-			data[fieldName] = generateRandomString(rand.Intn(32) + 5)
+			if idx, ok := card.pick(base); ok {
+				data[fieldName] = base + "_" + strconv.Itoa(idx)
+			} else {
+				data[fieldName] = generateRandomString(rand.Intn(32) + 5)
+			}
 		case 1: // number
-			data[fieldName] = rand.Intn(1000000)
+			if idx, ok := card.pick(base); ok {
+				data[fieldName] = int(indexedHash(base, idx) % 1000000)
+			} else {
+				data[fieldName] = rand.Intn(1000000)
+			}
 		case 2: // boolean
 			data[fieldName] = rand.Intn(2) == 1
 		}
@@ -272,12 +462,12 @@ func (dg *DataGenerator) timestampForRecord(idx int) time.Time {
 // GenerateData generates JSON data based on the generator configuration
 func (dg *DataGenerator) GenerateData() interface{} {
 	if dg.RecordsPerReq == 1 {
-		return generateRandomData(dg.FieldCount, dg.EnableBody, dg.EnableTraceID, dg.FlatMessage, dg.timestampForRecord(0))
+		return generateRandomData(dg.FieldCount, dg.EnableBody, dg.EnableTraceID, dg.FlatMessage, dg.Cardinality, dg.timestampForRecord(0))
 	}
 	// Generate multiple records, each at a different hour offset.
 	records := make([]map[string]interface{}, dg.RecordsPerReq)
 	for i := 0; i < dg.RecordsPerReq; i++ {
-		records[i] = generateRandomData(dg.FieldCount, dg.EnableBody, dg.EnableTraceID, dg.FlatMessage, dg.timestampForRecord(i))
+		records[i] = generateRandomData(dg.FieldCount, dg.EnableBody, dg.EnableTraceID, dg.FlatMessage, dg.Cardinality, dg.timestampForRecord(i))
 	}
 	return records
 }
@@ -369,6 +559,9 @@ func (c *HTTPClient) RunMultiple(times int, threads int, generator *DataGenerato
 	}
 	if generator != nil && generator.Hours > 1 {
 		fmt.Printf("Spreading record timestamps across %d past hours\n", generator.Hours)
+	}
+	if generator != nil && len(generator.Cardinality) > 0 {
+		fmt.Printf("Field cardinality (0 = unique): %s\n", generator.Cardinality)
 	}
 	fmt.Println(strings.Repeat("=", 60))
 
@@ -533,6 +726,7 @@ func main() {
 		enableBody    = flag.Bool("body", false, "Enable body field with random size (1KB-200KB)")
 		enableTraceID = flag.Bool("trace_id", false, "Generate a trace_id (32-char hex) for each record")
 		flatMessage   = flag.Bool("flat", false, "Merge log record fields into the top-level record instead of a 'message' JSON string")
+		cardinality   = flag.String("cardinality", "", "Override per-field max distinct values, e.g. 'ip=500,trace_id=20000' (0 = unique per record)")
 		rawURL        = flag.String("raw-url", "", "If set, post to this exact URL instead of building from -url/-org/-stream-prefix (disables stream rotation)")
 	)
 	flag.Parse()
@@ -593,6 +787,11 @@ func main() {
 
 	// Run the requests
 	if *data == "" {
+		fieldCard, err := parseCardinality(*cardinality)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
 		generator := &DataGenerator{
 			FieldCount:    *fieldCount,
 			RecordsPerReq: *recordsPerReq,
@@ -600,6 +799,7 @@ func main() {
 			EnableTraceID: *enableTraceID,
 			FlatMessage:   *flatMessage,
 			Hours:         *hours,
+			Cardinality:   fieldCard,
 		}
 		client.RunMultiple(*times, *threads, generator, ingestCfg)
 	} else {
