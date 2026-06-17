@@ -22,12 +22,13 @@ There is no test suite — `go test ./...` finds no tests. The repo is a single 
 
 Single-file Go CLI (`main.go`) that POSTs JSON payloads concurrently. It started as a generic HTTP load tool and has been specialized for **OpenObserve (O2)** ingest, while still supporting arbitrary endpoints via `-raw-url`.
 
-### Two URL strategies (mutually exclusive)
+### Three output sinks (mutually exclusive)
 
 - **O2 ingest builder** (default): `-url` is a base host; per request the URL is built as `<base>/api/<org>/<stream-prefix>_<i>/_json`, where `i` rotates over `-streams`. Driven by `IngestConfig.URLFor(requestNum)`.
 - **Raw URL**: `-raw-url` posts to one fixed URL with no stream rotation. Use for non-O2 targets (e.g. httpbin).
+- **File**: `-file PATH` writes generated records as NDJSON (one JSON record per line) to a local file and sends no HTTP, so external collectors (Vector, Fluent Bit, Filebeat, ...) can forward the data elsewhere. Stream rotation does not apply; data-generation knobs (`-hours`, `-records`, `-cardinality`, `-trace_id`, `-flat`, `-body`, `-data`) still do.
 
-The mode is decided in `main()` — if `-raw-url` is set, `ingestCfg` is `nil` and workers use `c.URL` directly; otherwise `ingestCfg` is non-nil and workers call `ingestCfg.URLFor(requestNum)`.
+The mode is decided in `main()`: `-file` takes precedence (calls `HTTPClient.RunToFile`, `ingestCfg` unused); else if `-raw-url` is set, `ingestCfg` is `nil` and workers use `c.URL` directly; otherwise `ingestCfg` is non-nil and workers call `ingestCfg.URLFor(requestNum)` via `RunMultiple`.
 
 ### O2 partition model — the central design idea
 
@@ -45,6 +46,8 @@ When changing timestamp/partition logic, keep this invariant: a single request m
 - Each worker makes a **per-request shallow copy** of `HTTPClient` (own headers map, own URL) to avoid sharing mutable state. Don't replace this with a shared client — the URL field is rewritten per request when rotating streams.
 - Counters are `atomic.Int64` (success/error/totalDuration). Avoid adding `sync.Mutex` to the hot path.
 - Output is throttled: a 2s ticker prints progress, and only the first 5 errors are printed per worker, to keep stdout from dominating runtime at 1M+ requests. Preserve this behavior when adding logging.
+
+`RunToFile` mirrors this model for `-file` output but swaps the HTTP POST for an NDJSON write: workers marshal a whole request's records into a local `bytes.Buffer`, then take a single `sync.Mutex` to append that buffer to one shared `bufio.Writer` (1 MiB buffer). The lock wraps only the write, not the marshal, so the hot path stays lock-light. Progress counts records written, not requests.
 
 ### Data generation
 

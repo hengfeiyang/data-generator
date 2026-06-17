@@ -18,6 +18,7 @@ A Go HTTP client that can post JSON data with HTTP basic authentication, print e
 - ✅ **Generate nginx-like log data**
 - ✅ **Generate random body field with configurable size (1KB-500KB)**
 - ✅ **OpenObserve-aware**: rotate across N streams and spread `_timestamp` over N past hours so writes land in many `(stream, hour)` partitions
+- ✅ **Write to a local file** as NDJSON (one record per line) for external collectors to pick up
 - ✅ Error handling and summary statistics
 
 ## Usage
@@ -81,6 +82,7 @@ go run main.go -raw-url "https://httpbin.org/post" \
 | `-streams` | Number of distinct streams to rotate across | `1` |
 | `-hours` | Spread record timestamps across N past hours (one record per hour per request) | `1` |
 | `-raw-url` | If set, POST to this exact URL instead of building from `-url/-org/-stream-prefix`. Disables stream rotation — useful for non-O2 targets like httpbin. | `""` |
+| `-file` | If set, write generated records as NDJSON (one record per line) to this file instead of sending HTTP. Takes precedence over `-url`/`-raw-url`. | `""` |
 | `-user` | Username for basic auth | `root@example.com` |
 | `-pass` | Password for basic auth | `Complexpass#123` |
 | `-times` | Number of HTTP requests to send | `1` |
@@ -249,6 +251,30 @@ go run main.go -fields 15 -records 2 -times 50 -threads 10
 go run main.go -raw-url "https://httpbin.org/post" -times 1000 -threads 50
 ```
 
+#### 11. Write to a Local File (NDJSON)
+Instead of sending HTTP, `-file` writes generated records to a local file as
+**NDJSON** — one JSON record per line — so external collectors (Vector, Fluent
+Bit, Filebeat, …) can tail the file and forward the data to any platform. No
+HTTP is sent and stream rotation does not apply, but all data-generation flags
+(`-fields`, `-records`, `-hours`, `-trace_id`, `-flat`, `-body`, `-cardinality`,
+`-data`) still work.
+
+```bash
+# Write 10 requests of generated data to a file
+go run main.go -file out.ndjson -times 10
+
+# 1,000 requests × 60 records = 60,000 NDJSON lines spread over 24 past hours
+go run main.go -file logs.ndjson -times 1000 -records 60 -hours 24 -trace_id -threads 8
+
+# Flattened records (no nested "message" string) — easiest for collectors to map
+go run main.go -file flat.ndjson -flat -fields 10 -records 5 -times 100
+
+# Then point your collector at the file, e.g. Vector:
+#   [sources.in]
+#   type = "file"
+#   include = ["out.ndjson"]
+```
+
 ## Auto-Generated Data Types
 
 ### Standard JSON Data
@@ -338,6 +364,26 @@ Summary:
    Wall Time:          6.184s
    Throughput:         162 req/s
    Avg Request:        191.234ms
+```
+
+In `-file` mode the progress tick and summary count **records written** instead
+of requests:
+
+```
+Auto-generating data for each request
+Writing 1000 request(s) as NDJSON to logs.ndjson
+Using 8 concurrent threads
+Spreading record timestamps across 24 past hours
+============================================================
+[    2s] 41200 records  20600 rec/s (avg 20600)
+============================================================
+Summary:
+   Output File:        logs.ndjson
+   Total Requests:     1000
+   Records Written:    60000
+   Failed:             0
+   Wall Time:          2.913s
+   Throughput:         20597 rec/s
 ```
 
 ## Error Handling

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/base64"
 	"encoding/binary"
@@ -696,6 +697,170 @@ func (c *HTTPClient) RunMultiple(times int, threads int, generator *DataGenerato
 	}
 }
 
+// appendRecords marshals a generated payload (a single record map or a slice of
+// them) into buf as NDJSON — one JSON record per line. It returns the number of
+// records written.
+func appendRecords(buf *bytes.Buffer, data interface{}) (int, error) {
+	switch v := data.(type) {
+	case map[string]interface{}:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return 0, err
+		}
+		buf.Write(b)
+		buf.WriteByte('\n')
+		return 1, nil
+	case []map[string]interface{}:
+		for _, rec := range v {
+			b, err := json.Marshal(rec)
+			if err != nil {
+				return 0, err
+			}
+			buf.Write(b)
+			buf.WriteByte('\n')
+		}
+		return len(v), nil
+	default:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return 0, err
+		}
+		buf.Write(b)
+		buf.WriteByte('\n')
+		return 1, nil
+	}
+}
+
+// RunToFile generates data and writes it as newline-delimited JSON (NDJSON) to
+// path — one record per line — so log collectors (Vector, Fluent Bit, Filebeat,
+// ...) can tail the file and forward records to any platform. No HTTP is sent
+// and stream rotation does not apply; only the data-generation knobs (hours,
+// records, cardinality, trace_id, flat, body) affect the output.
+func (c *HTTPClient) RunToFile(path string, times int, threads int, generator *DataGenerator) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %w", err)
+	}
+	defer f.Close()
+
+	// Single buffered writer guarded by a mutex. Each worker marshals a whole
+	// request's records into a local buffer, then takes the lock once to flush
+	// that buffer, keeping lock contention off the marshal-heavy hot path.
+	w := bufio.NewWriterSize(f, 1<<20)
+	var writeMu sync.Mutex
+
+	fmt.Printf("Writing %d request(s) as NDJSON to %s\n", times, path)
+	if threads > 1 {
+		fmt.Printf("Using %d concurrent threads\n", threads)
+	}
+	if generator != nil && generator.Hours > 1 {
+		fmt.Printf("Spreading record timestamps across %d past hours\n", generator.Hours)
+	}
+	if generator != nil && len(generator.Cardinality) > 0 {
+		fmt.Printf("Field cardinality (0 = unique): %s\n", generator.Cardinality)
+	}
+	fmt.Println(strings.Repeat("=", 60))
+
+	var (
+		recordCount atomic.Int64
+		errorCount  atomic.Int64
+		wg          sync.WaitGroup
+	)
+
+	workChan := make(chan int, threads*4)
+
+	tickerDone := make(chan struct{})
+	go func() {
+		t := time.NewTicker(2 * time.Second)
+		defer t.Stop()
+		start := time.Now()
+		var lastTotal int64
+		for {
+			select {
+			case <-tickerDone:
+				return
+			case <-t.C:
+				recs := recordCount.Load()
+				elapsed := time.Since(start).Seconds()
+				windowRate := float64(recs-lastTotal) / 2.0
+				avgRate := 0.0
+				if elapsed > 0 {
+					avgRate = float64(recs) / elapsed
+				}
+				fmt.Printf("[%6s] %d records  %.0f rec/s (avg %.0f)\n",
+					time.Since(start).Round(time.Second), recs, windowRate, avgRate)
+				lastTotal = recs
+			}
+		}
+	}()
+
+	for i := 0; i < threads; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			var buf bytes.Buffer
+			for range workChan {
+				buf.Reset()
+				var payload interface{}
+				if generator != nil {
+					payload = generator.GenerateData()
+				} else {
+					payload = c.Data
+				}
+				n, err := appendRecords(&buf, payload)
+				if err != nil {
+					errorCount.Add(1)
+					if errorCount.Load() <= 5 {
+						fmt.Printf("[worker %d] marshal error: %v\n", workerID, err)
+					}
+					continue
+				}
+				writeMu.Lock()
+				_, werr := w.Write(buf.Bytes())
+				writeMu.Unlock()
+				if werr != nil {
+					errorCount.Add(1)
+					if errorCount.Load() <= 5 {
+						fmt.Printf("[worker %d] write error: %v\n", workerID, werr)
+					}
+					continue
+				}
+				recordCount.Add(int64(n))
+			}
+		}(i)
+	}
+
+	wallStart := time.Now()
+
+	for i := 1; i <= times; i++ {
+		workChan <- i
+	}
+	close(workChan)
+
+	wg.Wait()
+	close(tickerDone)
+
+	if err := w.Flush(); err != nil {
+		return fmt.Errorf("failed to flush output file: %w", err)
+	}
+
+	wallElapsed := time.Since(wallStart)
+	recs := recordCount.Load()
+	errs := errorCount.Load()
+
+	fmt.Println(strings.Repeat("=", 60))
+	fmt.Printf("Summary:\n")
+	fmt.Printf("   Output File:        %s\n", path)
+	fmt.Printf("   Total Requests:     %d\n", times)
+	fmt.Printf("   Records Written:    %d\n", recs)
+	fmt.Printf("   Failed:             %d\n", errs)
+	fmt.Printf("   Wall Time:          %s\n", wallElapsed.Round(time.Millisecond))
+	if wallElapsed > 0 {
+		fmt.Printf("   Throughput:         %.0f rec/s\n", float64(recs)/wallElapsed.Seconds())
+	}
+	return nil
+}
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
@@ -728,11 +893,12 @@ func main() {
 		flatMessage   = flag.Bool("flat", false, "Merge log record fields into the top-level record instead of a 'message' JSON string")
 		cardinality   = flag.String("cardinality", "", "Override per-field max distinct values, e.g. 'ip=500,trace_id=20000' (0 = unique per record)")
 		rawURL        = flag.String("raw-url", "", "If set, post to this exact URL instead of building from -url/-org/-stream-prefix (disables stream rotation)")
+		outFile       = flag.String("file", "", "If set, write generated records as NDJSON to this file instead of sending HTTP (one record per line)")
 	)
 	flag.Parse()
 
 	// Validate required parameters
-	if *baseURL == "" && *rawURL == "" {
+	if *baseURL == "" && *rawURL == "" && *outFile == "" {
 		fmt.Println("Error: -url is required")
 		flag.PrintDefaults()
 		os.Exit(1)
@@ -762,10 +928,13 @@ func main() {
 		}
 	}
 
-	// Decide URL strategy: raw URL (no rotation) vs O2 ingest builder.
+	// Decide URL strategy: file output (no HTTP), raw URL (no rotation), or the
+	// O2 ingest builder. -file takes precedence over the HTTP targets.
 	var ingestCfg *IngestConfig
 	fixedURL := ""
-	if *rawURL != "" {
+	if *outFile != "" {
+		// No URL needed in file mode.
+	} else if *rawURL != "" {
 		fixedURL = *rawURL
 	} else {
 		ingestCfg = &IngestConfig{
@@ -785,14 +954,15 @@ func main() {
 		}
 	}
 
-	// Run the requests
+	// Build the data generator when auto-generating.
+	var generator *DataGenerator
 	if *data == "" {
 		fieldCard, err := parseCardinality(*cardinality)
 		if err != nil {
 			fmt.Printf("Error: %v\n", err)
 			os.Exit(1)
 		}
-		generator := &DataGenerator{
+		generator = &DataGenerator{
 			FieldCount:    *fieldCount,
 			RecordsPerReq: *recordsPerReq,
 			EnableBody:    *enableBody,
@@ -801,8 +971,15 @@ func main() {
 			Hours:         *hours,
 			Cardinality:   fieldCard,
 		}
-		client.RunMultiple(*times, *threads, generator, ingestCfg)
-	} else {
-		client.RunMultiple(*times, *threads, nil, ingestCfg)
 	}
+
+	// Dispatch: write to a local file, or send HTTP requests.
+	if *outFile != "" {
+		if err := client.RunToFile(*outFile, *times, *threads, generator); err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	client.RunMultiple(*times, *threads, generator, ingestCfg)
 }
